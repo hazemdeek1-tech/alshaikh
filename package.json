@@ -1,0 +1,14 @@
+{
+  "name": "sheikh-whatsapp-bot-v8-pro",
+  "version": "8.0.0",
+  "description": "Sheikh WhatsApp Bot v8.0 Pro - Academic Vault, AI Study Suite, Admin Authority & 24/7 Cloud Ready",
+  "main": "sheikh_whatsapp_bot_v8.js",
+  "scripts": {
+    "start": "node sheikh_whatsapp_bot_v8.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pdf-parse": "^1.1.1",
+    "pino": "^9.6.0"
+  }
+}

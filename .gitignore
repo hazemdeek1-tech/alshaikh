@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.session
+sheikh_whatsapp_auth/
+sheikh_warnings.json
+sheikh_member_memory.json
+sheikh_missing_requests.json
+sheikh_runtime_settings.json
+sheikh_group_log.json
+allowed_group.json
+*.db
+*.sqlite
+__pycache__/
