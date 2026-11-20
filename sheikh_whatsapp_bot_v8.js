@@ -46,8 +46,12 @@ const CONFIG = {
     randomChatCooldownSec: parseInt(process.env.RANDOM_CHAT_COOLDOWN_SEC || "150", 10),
     uniquePdfsDir: process.env.UNIQUE_PDFS_DIR || "/content/drive/MyDrive/Telegram_PDF_Archive/Unique_PDFs",
     indexCsvPath: process.env.INDEX_CSV_PATH || "/content/drive/MyDrive/Telegram_PDF_Archive/Logs_and_State/whatsapp_bot_index.csv",
-    authDir: process.env.AUTH_DIR || "/content/drive/MyDrive/Telegram_PDF_Archive/Logs_and_State/sheikh_whatsapp_auth",
-    stateDir: process.env.STATE_DIR || "/content/drive/MyDrive/Telegram_PDF_Archive/Logs_and_State",
+    driveFolderId: (process.env.DRIVE_FOLDER_ID || "1pKdPPsA6wrVfL1-NWtvcFwAXq_gFS9K2").trim(),
+    driveIndexCsvId: (process.env.DRIVE_INDEX_CSV_ID || "1pf9TyU1RKQpgBB0J0V-cZzmimYsbQK0h").trim(),
+    driveApiKey: (process.env.GOOGLE_DRIVE_API_KEY || "").trim(),
+    whatsappAuthB64: (process.env.WHATSAPP_AUTH_B64 || "").trim(),
+    authDir: process.env.AUTH_DIR || (fs.existsSync("/content/drive/MyDrive") ? "/content/drive/MyDrive/Telegram_PDF_Archive/Logs_and_State/sheikh_whatsapp_auth" : "/tmp/sheikh_whatsapp_auth"),
+    stateDir: process.env.STATE_DIR || (fs.existsSync("/content/drive/MyDrive") ? "/content/drive/MyDrive/Telegram_PDF_Archive/Logs_and_State" : "/tmp/sheikh_state"),
     httpPort: parseInt(process.env.PORT || "3000", 10)
 };
 
@@ -457,6 +461,117 @@ class ModerationManager {
 
 const moderation = new ModerationManager(PATHS.warnings);
 
+
+// ================= DIRECT GOOGLE DRIVE CLOUD STREAMING (FOR RENDER / KOYEB) =================
+const zlib = require("zlib");
+
+function isCloudDriveMode() {
+    return !fs.existsSync(CONFIG.uniquePdfsDir) && Boolean(CONFIG.driveFolderId);
+}
+
+async function fetchDriveIndexCsvCloud() {
+    if (!CONFIG.driveIndexCsvId) return "";
+    const urls = [];
+    if (CONFIG.driveApiKey) {
+        urls.push(`https://www.googleapis.com/drive/v3/files/${CONFIG.driveIndexCsvId}?alt=media&key=${encodeURIComponent(CONFIG.driveApiKey)}`);
+    }
+    urls.push(`https://drive.google.com/uc?export=download&id=${CONFIG.driveIndexCsvId}`);
+    for (const url of urls) {
+        try {
+            const resp = await fetch(url, { redirect: "follow" });
+            if (resp.ok) {
+                const txt = await resp.text();
+                if (txt && txt.includes("stored_filename")) return txt;
+            }
+        } catch (e) {}
+    }
+    return "";
+}
+
+async function listDriveFolderCloud() {
+    if (!CONFIG.driveApiKey || !CONFIG.driveFolderId) return [];
+    const files = [];
+    let pageToken = "";
+    try {
+        do {
+            const q = encodeURIComponent(`'${CONFIG.driveFolderId}' in parents and trashed = false`);
+            const fields = encodeURIComponent("nextPageToken,files(id,name,size)");
+            const url = `https://www.googleapis.com/drive/v3/files?q=${q}&fields=${fields}&pageSize=1000&key=${encodeURIComponent(CONFIG.driveApiKey)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                console.warn(`[CloudDrive] Folder list HTTP ${resp.status}`);
+                break;
+            }
+            const data = await resp.json();
+            for (const f of (data.files || [])) {
+                if (f.name && f.name.toLowerCase().endsWith(".pdf")) {
+                    files.push({ id: f.id, name: f.name, sizeBytes: parseInt(f.size || "0", 10) || 0 });
+                }
+            }
+            pageToken = data.nextPageToken || "";
+        } while (pageToken && files.length < 10000);
+    } catch (err) {
+        console.warn("[CloudDrive] List error:", err.message);
+    }
+    return files;
+}
+
+async function downloadDrivePdfToTemp(driveFileId, filename) {
+    const tmpDir = "/tmp/sheikh_pdf_cache";
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const safeName = filename.replace(/[\\/]/g, "_");
+    const tmpPath = path.join(tmpDir, `${Date.now()}_${safeName}`);
+    const urls = [];
+    if (CONFIG.driveApiKey) {
+        urls.push(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media&key=${encodeURIComponent(CONFIG.driveApiKey)}`);
+    }
+    urls.push(`https://drive.google.com/uc?export=download&confirm=t&id=${driveFileId}`);
+    for (const url of urls) {
+        try {
+            const resp = await fetch(url, { redirect: "follow" });
+            if (!resp.ok) continue;
+            const ctype = (resp.headers.get("content-type") || "").toLowerCase();
+            if (ctype.includes("text/html")) continue;
+            const arrBuf = await resp.arrayBuffer();
+            const buf = Buffer.from(arrBuf);
+            if (buf.length > 512) {
+                fs.writeFileSync(tmpPath, buf);
+                return tmpPath;
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+function restoreAuthFromEnvIfNeeded() {
+    if (!CONFIG.whatsappAuthB64) return;
+    const credsPath = path.join(CONFIG.authDir, "creds.json");
+    if (fs.existsSync(credsPath)) return;
+    try {
+        fs.mkdirSync(CONFIG.authDir, { recursive: true });
+        const raw = zlib.gunzipSync(Buffer.from(CONFIG.whatsappAuthB64, "base64")).toString("utf8");
+        const bundle = JSON.parse(raw);
+        for (const [fname, content] of Object.entries(bundle)) {
+            fs.writeFileSync(path.join(CONFIG.authDir, fname), content, "utf8");
+        }
+        console.log(`[Auth] Restored ${Object.keys(bundle).length} session files from WHATSAPP_AUTH_B64.`);
+    } catch (err) {
+        console.warn("[Auth] Failed to restore WHATSAPP_AUTH_B64:", err.message);
+    }
+}
+
+function printAuthExportHintOnce() {
+    if (CONFIG.whatsappAuthB64 || fs.existsSync("/content/drive/MyDrive")) return;
+    try {
+        const credsPath = path.join(CONFIG.authDir, "creds.json");
+        if (!fs.existsSync(credsPath)) return;
+        const bundle = { "creds.json": fs.readFileSync(credsPath, "utf8") };
+        const b64 = zlib.gzipSync(Buffer.from(JSON.stringify(bundle), "utf8")).toString("base64");
+        console.log("\n[Render Persistence Tip] Save this as WHATSAPP_AUTH_B64 in Render Environment Variables so you never re-pair:");
+        console.log(b64.slice(0, 80) + "... (length " + b64.length + ")\n");
+    } catch (e) {}
+}
+
 // ================= BULLETPROOF VAULT SEARCH ENGINE =================
 class SheikhVaultIndex {
     constructor() {
@@ -464,7 +579,7 @@ class SheikhVaultIndex {
         this.lastReloadTime = 0;
         this.totalSizeMb = 0;
     }
-    buildItem(fname, caption, fullPath, sizeBytes) {
+    buildItem(fname, caption, fullPath, sizeBytes, driveFileId = null) {
         const sizeMb = +(sizeBytes / (1024 * 1024)).toFixed(2);
         const combinedSearchText = normalizeArabic(`${fname} ${caption}`);
         const tokens = combinedSearchText.split(" ").filter(t => t.length > 1 || /^\d+$/.test(t));
@@ -473,6 +588,7 @@ class SheikhVaultIndex {
             storedFilename: fname,
             caption,
             fullPath,
+            driveFileId,
             sizeBytes,
             sizeMb,
             sizeKb: +(sizeBytes / 1024).toFixed(1),
@@ -534,9 +650,46 @@ class SheikhVaultIndex {
             }
         }
 
+        if (loadedItems.length > 0) {
+            this.items = loadedItems;
+            this.totalSizeMb = +(totalBytes / (1024 * 1024)).toFixed(2);
+            console.log(`[Vault] Indexed ${this.items.length} unique PDFs (${this.totalSizeMb} MB) from local disk.`);
+        }
+    }
+    async reloadCloudIfNeeded(force = false) {
+        if (!isCloudDriveMode()) {
+            this.reloadIfNeeded(force);
+            return;
+        }
+        const now = Date.now();
+        if (!force && now - this.lastReloadTime < 300000 && this.items.length > 0) return;
+        this.lastReloadTime = now;
+        console.log("[CloudDrive] Syncing Bank Al-Ma'rifa index directly from Google Drive...");
+        const csvText = await fetchDriveIndexCsvCloud();
+        const csvEntries = new Map();
+        if (csvText) {
+            const lines = csvText.split(/\r?\n/);
+            for (let i = 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line) continue;
+                const parts = parseCsvLine(line);
+                if (parts.length >= 4) {
+                    csvEntries.set(parts[1].trim(), { caption: parts[0].trim(), sizeKb: parseFloat(parts[3]) || 0 });
+                }
+            }
+        }
+        const driveFiles = await listDriveFolderCloud();
+        const loadedItems = [];
+        let totalBytes = 0;
+        for (const f of driveFiles) {
+            totalBytes += f.sizeBytes;
+            const csvMeta = csvEntries.get(f.name);
+            const caption = (csvMeta && csvMeta.caption) ? csvMeta.caption : f.name;
+            loadedItems.push(this.buildItem(f.name, caption, "", f.sizeBytes, f.id));
+        }
         this.items = loadedItems;
         this.totalSizeMb = +(totalBytes / (1024 * 1024)).toFixed(2);
-        console.log(`[Vault] Indexed ${this.items.length} unique PDFs (${this.totalSizeMb} MB).`);
+        console.log(`[CloudDrive] Ready! Indexed ${this.items.length} unique PDFs (${this.totalSizeMb} MB) directly from Google Drive.`);
     }
     search(rawQuery) {
         this.reloadIfNeeded(false);
@@ -940,13 +1093,19 @@ async function deliverPdfMatches(sock, remoteJid, quotedMsg, searchResult, intro
     await sendBotMessage(sock, remoteJid, { text: introText }, { quoted: quotedMsg });
 
     for (const item of toSend) {
+        let tempCloudPath = null;
         try {
-            if (!fs.existsSync(item.fullPath)) continue;
+            let sendPath = item.fullPath;
+            if ((!sendPath || !fs.existsSync(sendPath)) && item.driveFileId) {
+                tempCloudPath = await downloadDrivePdfToTemp(item.driveFileId, item.storedFilename);
+                sendPath = tempCloudPath;
+            }
+            if (!sendPath || !fs.existsSync(sendPath)) continue;
             await sendBotMessage(
                 sock,
                 remoteJid,
                 {
-                    document: { url: item.fullPath },
+                    document: { url: sendPath },
                     mimetype: "application/pdf",
                     fileName: item.storedFilename,
                     caption: `${item.caption} (${item.sizeMb} MB)`
@@ -957,6 +1116,10 @@ async function deliverPdfMatches(sock, remoteJid, quotedMsg, searchResult, intro
             await sleepMs(1100);
         } catch (err) {
             console.error(`[PDF Send Error] ${item.storedFilename}:`, err.message);
+        } finally {
+            if (tempCloudPath && fs.existsSync(tempCloudPath)) {
+                try { fs.unlinkSync(tempCloudPath); } catch (e) {}
+            }
         }
     }
     return true;
@@ -1016,9 +1179,10 @@ async function startSheikhBot() {
     const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = baileys;
     const pino = (await import("pino")).default;
 
+    restoreAuthFromEnvIfNeeded();
     checkAndResetIfPhoneChanged();
     fs.mkdirSync(CONFIG.authDir, { recursive: true });
-    vault.reloadIfNeeded(true);
+    await vault.reloadCloudIfNeeded(true);
     loadCachedAllowedGroup();
 
     const { state, saveCreds } = await useMultiFileAuthState(CONFIG.authDir);
@@ -1068,8 +1232,9 @@ async function startSheikhBot() {
             runtimeStatus.pairingCode = null;
             runtimeStatus.botJid = sock.user?.id || "connected";
             await resolveLockedGroupFromInvite(sock);
+            printAuthExportHintOnce();
             console.log("\n==================================================================");
-            console.log(`SUCCESS: SHEIKH BOT v8.0 PRO IS ONLINE (${runtimeStatus.botJid})`);
+            console.log(`SUCCESS: SHEIKH BOT v8.1 PRO (CLOUD READY) IS ONLINE (${runtimeStatus.botJid})`);
             console.log(`Vault '${CONFIG.vaultName}' Ready: ${vault.items.length} PDFs (${vault.totalSizeMb} MB)`);
             console.log(`Group Lock: ${runtimeStatus.lockedGroupJid || "PENDING"} | DMs: ${CONFIG.allowPrivateDm ? "ON" : "OFF"} | AntiLink: ${liveSettings.antiLink ? "ON" : "OFF"}`);
             console.log("==================================================================\n");
